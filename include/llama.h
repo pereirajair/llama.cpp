@@ -1001,6 +1001,14 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Tensor parallelism without weight transfer (each rank loads its own
+    // tensor shard). Register a callback that sums a tensor across the group in
+    // place: the reduce op inserted after row-parallel projections calls it
+    // during graph compute. Set the callback to NULL to disable (plain build).
+    typedef void (*llama_tp_reduce_callback)(void * data, size_t n_bytes, void * userdata);
+
+    LLAMA_API void llama_set_tp_reduce_callback(llama_tp_reduce_callback callback, void * userdata);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //
