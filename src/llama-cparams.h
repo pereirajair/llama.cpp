@@ -54,6 +54,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool moe_external_executor;
+    const uint8_t * moe_external_executor_layers = nullptr;
+    size_t moe_external_executor_layer_count = 0;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

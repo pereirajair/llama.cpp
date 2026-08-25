@@ -1065,6 +1065,11 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.moe_external_executor_layers != nullptr && params.moe_external_executor_layer_count > 0) {
+        external_moe_executor_layers.assign(
+            params.moe_external_executor_layers,
+            params.moe_external_executor_layers + params.moe_external_executor_layer_count);
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -2067,6 +2072,25 @@ bool llama_model::uses_external_moe_executor() const {
     return params.moe_external_executor;
 }
 
+bool llama_model::uses_external_moe_executor_layer(int il) const {
+    if (!params.moe_external_executor) {
+        return false;
+    }
+    if (external_moe_executor_layers.empty()) {
+        return true;
+    }
+    return il >= 0 && static_cast<size_t>(il) < external_moe_executor_layers.size()
+        && external_moe_executor_layers[il] != 0;
+}
+
+const uint8_t * llama_model::external_moe_executor_layers_data() const {
+    return external_moe_executor_layers.empty() ? nullptr : external_moe_executor_layers.data();
+}
+
+size_t llama_model::external_moe_executor_layers_count() const {
+    return external_moe_executor_layers.size();
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2509,6 +2533,8 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.moe_external_executor       =*/ false,
+        /*.moe_external_executor_layers =*/ nullptr,
+        /*.moe_external_executor_layer_count =*/ 0,
     };
 
     return result;
