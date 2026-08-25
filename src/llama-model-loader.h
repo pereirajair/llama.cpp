@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -81,6 +82,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool moe_external_executor;
 
     llama_files files;
     llama_ftype ftype;
@@ -113,6 +115,8 @@ struct llama_model_loader {
     };
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    ggml_context_ptr external_moe_ctx;
+    std::unordered_set<std::string> external_moe_tensor_names;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -132,8 +136,13 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool moe_external_executor,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    // Transfers the metadata-only context to llama_model. Its tensors have
+    // names, shapes and dtypes but no backend buffer or data allocation.
+    ggml_context_ptr take_external_moe_context();
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
