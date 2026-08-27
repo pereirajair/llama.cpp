@@ -95,6 +95,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
+        GGML_ASSERT(ubatch->n_embd == 0 || n_embd == ubatch->n_embd);
 
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -106,7 +107,9 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd &&
+            (!params.ubatch.n_embd || embd->ne[0] == params.ubatch.n_embd) &&
+            embd->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -138,8 +141,12 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd &&
+            (!params.ubatch.n_embd || embd->ne[0] == params.ubatch.n_embd) &&
+            embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (h &&
+            (!params.ubatch.n_embd || h->ne[0] == params.ubatch.n_embd) &&
+            h->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -2615,17 +2622,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
+    const bool vector_input  = ubatch.embd != nullptr;
+    const int64_t n_embd_input = vector_input && ubatch.n_embd > 0 ? ubatch.n_embd : n_embd_inp;
 
     assert(n_embd_inp >= n_embd);
+    assert(n_embd_input >= n_embd);
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_input);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_input, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
@@ -2657,8 +2667,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
             cur = ggml_add(ctx0, cur, inpL_delta);
         }
 
-        if (n_embd_inp != n_embd) {
-            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+        if (n_embd_input != n_embd) {
+            cur = ggml_pad(ctx0, cur, n_embd_input - n_embd, 0, 0, 0);
         }
     }
 
@@ -2674,7 +2684,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
 
-    if (n_embd_inp != n_embd) {
+    const bool preserve_expanded_input = vector_input && n_embd_input != n_embd_inp;
+    if (n_embd_inp != n_embd && !preserve_expanded_input) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
     }
 

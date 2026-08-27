@@ -1693,7 +1693,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    const int64_t n_embd_inp = hparams.n_embd_inp();
+    const int64_t n_embd_out = hparams.n_embd_out();
+    const int64_t batch_n_embd = batch_inp.embd && batch_inp.n_embd > 0 ? batch_inp.n_embd : 0;
+    const int64_t n_embd = batch_n_embd > 0 ? batch_n_embd : (mtp_embd ? n_embd_out : n_embd_inp);
+    const bool canonical_input_width = batch_n_embd == n_embd_inp;
+    const bool expanded_input_width = batch_n_embd == n_embd_out &&
+            n_embd_out > n_embd_inp && n_embd_out % hparams.n_embd == 0;
+
+    if (batch_n_embd > 0 &&
+            (!canonical_input_width && !expanded_input_width)) {
+        LLAMA_LOG_ERROR(
+                "%s: embedding input shape [%d, %lld] has unsupported width %lld, expected %lld or %lld\n",
+                __func__, batch_inp.n_tokens, (long long) batch_n_embd, (long long) batch_n_embd,
+                (long long) n_embd_inp, (long long) n_embd_out);
+        return -1;
+    }
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;

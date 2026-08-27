@@ -143,6 +143,7 @@ struct server_batch {
         if (batch.token == nullptr) {
             batch.token = tokens_ptr;
             batch.embd  = nullptr;
+            batch.n_embd = 0;
         }
     }
 
@@ -167,6 +168,7 @@ struct server_batch {
             batch.token = nullptr; // will be restored on clear()
             batch.embd  = embd.data();
         }
+        batch.n_embd = has_embd ? n_embd : 0;
         batch_rendered = true;
     }
 
@@ -187,6 +189,7 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
+            batch.n_embd,
         };
 
         return view;
