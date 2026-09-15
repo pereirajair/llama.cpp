@@ -150,6 +150,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build_and_test(test-fit-memory.cpp)
+llama_build(test-hybrid-memory-batch.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -226,6 +227,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-hybrid-memory-batch
+        NAME test-hybrid-memory-batch-kimi-k3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+    )
+    set_tests_properties(test-hybrid-memory-batch-kimi-k3 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 endif()
