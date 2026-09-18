@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -756,6 +758,153 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
 
 static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+static int ggml_backend_sched_route_trace_layer() {
+    static const int layer = [] {
+        const char * raw = getenv("POM_MOE_ROUTE_COPY_TRACE");
+        if (raw == nullptr || *raw == '\0') {
+            return -1;
+        }
+        if (strcmp(raw, "1") == 0 || strcmp(raw, "true") == 0 ||
+                strcmp(raw, "yes") == 0 || strcmp(raw, "on") == 0) {
+            return 0;
+        }
+
+        const char * number = raw;
+        if (strncmp(raw, "layer=", 6) == 0 || strncmp(raw, "layer:", 6) == 0) {
+            number += 6;
+        }
+        char * end = nullptr;
+        const long value = strtol(number, &end, 10);
+        if (end == number || *end != '\0' || value < 0 || value > INT_MAX) {
+            return -1;
+        }
+        return static_cast<int>(value);
+    }();
+    return layer;
+}
+
+static const char * ggml_backend_sched_route_trace_role(const ggml_tensor * tensor, int layer) {
+    const char * name = tensor == nullptr ? nullptr : ggml_get_name(tensor);
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    for (const char * prefix : {"ffn_moe_topk-", "ffn_moe_weights-"}) {
+        const char * match = strstr(name, prefix);
+        if (match == nullptr) {
+            continue;
+        }
+
+        char * end = nullptr;
+        const long parsed_layer = strtol(match + strlen(prefix), &end, 10);
+        if (end == match + strlen(prefix) || parsed_layer != layer ||
+                !(*end == '\0' || *end == ' ' || *end == '(')) {
+            continue;
+        }
+        return strcmp(prefix, "ffn_moe_topk-") == 0 ? "selected" : "weights";
+    }
+    return nullptr;
+}
+
+static ggml_backend_buffer_t ggml_backend_sched_route_trace_buffer(const ggml_tensor * tensor) {
+    return tensor == nullptr ? nullptr : (tensor->view_src == nullptr ? tensor->buffer : tensor->view_src->buffer);
+}
+
+static void ggml_backend_sched_trace_route_copy(
+        ggml_backend_t       input_backend,
+        ggml_backend_t       split_backend,
+        const ggml_tensor  * input,
+        const ggml_tensor  * input_cpy) {
+    const int layer = ggml_backend_sched_route_trace_layer();
+    if (layer < 0) {
+        return;
+    }
+    const char * role = ggml_backend_sched_route_trace_role(input, layer);
+    if (role == nullptr || input == nullptr || input_cpy == nullptr) {
+        return;
+    }
+
+    static std::atomic<bool> selected_emitted = false;
+    static std::atomic<bool> weights_emitted = false;
+    std::atomic<bool> & emitted = strcmp(role, "selected") == 0 ? selected_emitted : weights_emitted;
+    if (emitted.exchange(true)) {
+        return;
+    }
+
+    // The trace is diagnostic-only, so make both sides quiescent before reading
+    // content. This keeps the samples meaningful for asynchronous CUDA copies.
+    ggml_backend_synchronize(input_backend);
+    ggml_backend_synchronize(split_backend);
+
+    const ggml_backend_buffer_t src_buffer = ggml_backend_sched_route_trace_buffer(input);
+    const ggml_backend_buffer_t dst_buffer = ggml_backend_sched_route_trace_buffer(input_cpy);
+    const char * src_buffer_name = src_buffer == nullptr ? "<null>" : ggml_backend_buffer_name(src_buffer);
+    const char * dst_buffer_name = dst_buffer == nullptr ? "<null>" : ggml_backend_buffer_name(dst_buffer);
+    const char * src_name = ggml_get_name(input);
+    const char * dst_name = ggml_get_name(input_cpy);
+
+    if (input->data == nullptr || input_cpy->data == nullptr ||
+            input->type != input_cpy->type ||
+            (input->type != GGML_TYPE_I32 && input->type != GGML_TYPE_F32)) {
+        GGML_LOG_WARN(
+            "POM_MOE_ROUTE_COPY_TRACE copy layer=%d role=%s src=%s src_ptr=%p src_backend=%s dst=%s dst_ptr=%p dst_backend=%s type=%s values=<unavailable>\n",
+            layer,
+            role,
+            src_name,
+            input->data,
+            src_buffer_name,
+            dst_name,
+            input_cpy->data,
+            dst_buffer_name,
+            ggml_type_name(input->type));
+        return;
+    }
+
+    const size_t count = std::min<size_t>(4, static_cast<size_t>(ggml_nelements(input)));
+    std::ostringstream src_values;
+    std::ostringstream dst_values;
+    if (input->type == GGML_TYPE_I32) {
+        int32_t src_sample[4] = {};
+        int32_t dst_sample[4] = {};
+        ggml_backend_tensor_get(input, src_sample, 0, count * sizeof(src_sample[0]));
+        ggml_backend_tensor_get(input_cpy, dst_sample, 0, count * sizeof(dst_sample[0]));
+        for (size_t i = 0; i < count; ++i) {
+            if (i != 0) {
+                src_values << ',';
+                dst_values << ',';
+            }
+            src_values << src_sample[i];
+            dst_values << dst_sample[i];
+        }
+    } else {
+        float src_sample[4] = {};
+        float dst_sample[4] = {};
+        ggml_backend_tensor_get(input, src_sample, 0, count * sizeof(src_sample[0]));
+        ggml_backend_tensor_get(input_cpy, dst_sample, 0, count * sizeof(dst_sample[0]));
+        for (size_t i = 0; i < count; ++i) {
+            if (i != 0) {
+                src_values << ',';
+                dst_values << ',';
+            }
+            src_values << src_sample[i];
+            dst_values << dst_sample[i];
+        }
+    }
+
+    GGML_LOG_WARN(
+        "POM_MOE_ROUTE_COPY_TRACE copy layer=%d role=%s src=%s src_ptr=%p src_backend=%s src_values=[%s] dst=%s dst_ptr=%p dst_backend=%s dst_values=[%s]\n",
+        layer,
+        role,
+        src_name,
+        input->data,
+        src_buffer_name,
+        src_values.str().c_str(),
+        dst_name,
+        input_cpy->data,
+        dst_buffer_name,
+        dst_values.str().c_str());
 }
 
 // scheduler
@@ -1788,6 +1937,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
+
+                    ggml_backend_sched_trace_route_copy(input_backend, split_backend, input, input_cpy);
                 }
             }
         }

@@ -18,6 +18,7 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
+struct llama_context;
 struct llama_layer;
 
 struct llama_memory_context_i;
@@ -32,6 +33,20 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+
+// Route tensors are graph results, not model weights. Their layout may be a
+// view or another non-contiguous result of top-k/gather operations. Normalize
+// only that exceptional layout before ggml_reshape_2d, which requires a
+// contiguous source. Contiguous tensors are passed through without a copy.
+ggml_tensor * llama_moe_reshape_route_2d(
+        ggml_context * ctx,
+        ggml_tensor * tensor,
+        int64_t       ne0,
+        int64_t       ne1);
+
+// Keep the route-copy trace scoped to one selected MoE layer. This predicate
+// is exposed for the focused regression test; the trace itself remains opt-in.
+bool llama_moe_route_trace_layer_name(const char * name, int layer);
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -774,6 +789,7 @@ struct llm_graph_params {
 
     llama_hparams hparams;
     llama_cparams cparams;
+    const llama_context * context = nullptr;
 
     llama_ubatch ubatch; // note: intentionally make a copy
 
@@ -986,6 +1002,7 @@ struct llm_graph_context {
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
+    const llama_context  * context;
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
@@ -1108,6 +1125,34 @@ struct llm_graph_context {
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
                      int   il) const;
+
+    // Returns a custom graph node when an external MoE executor is registered.
+    // The common builder supplies routing, tensor layout and all model-specific
+    // expert metadata. A registered callback never falls back to native
+    // experts if it rejects the descriptor.
+    ggml_tensor * build_moe_ffn_external(
+             ggml_tensor * cur,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+             ggml_tensor * gate_up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * up_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps_b,
+             ggml_tensor * gate_exps_b,
+             ggml_tensor * up_exps_b,
+             ggml_tensor * down_exps_b,
+             ggml_tensor * gate_exps_s,
+             ggml_tensor * up_exps_s,
+             ggml_tensor * down_exps_s,
+             int64_t       n_expert,
+             int64_t       n_expert_used,
+             llm_ffn_op_type type_op,
+             bool          norm_w,
+             float         w_scale,
+             llama_expert_gating_func_type gating_op,
+             bool          weight_before_ffn,
+             int           il) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

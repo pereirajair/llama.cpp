@@ -248,7 +248,7 @@ extern "C" {
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
     //
     // - token  : the token ids of the input (used when embd is NULL)
-    // - embd   : token embeddings (i.e. float vector of size n_embd) (used when token is NULL)
+    // - embd   : token embeddings (i.e. float vectors with n_embd values per row) (used when token is NULL)
     // - pos    : the positions of the respective token in the sequence
     //            (if set to NULL, the token position will be tracked automatically by llama_encode/llama_decode)
     // - seq_id : the sequence to which the respective token belongs
@@ -268,6 +268,10 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // Number of float values in each row pointed to by embd. A zero value
+        // keeps the legacy behavior for manually assembled batches.
+        int32_t          n_embd;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -347,6 +351,15 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        // Do not allocate routed MoE expert tensors in llama.cpp. The external
+        // executor receives their metadata and owns their storage instead.
+        bool moe_external_executor;
+        // Optional per-layer ownership. A non-empty list makes ownership
+        // data-driven: 1 externalizes that layer, 0 keeps its native expert
+        // tensors and graph. The pointed-to storage is copied by the model
+        // during loading.
+        const uint8_t * moe_external_executor_layers;
+        size_t moe_external_executor_layer_count;
     };
 
     struct llama_sampler_seq_config {
@@ -356,6 +369,67 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    // A tensor passed to the generic opt-in MoE replacement hook. The
+    // descriptor is copied into the graph context, so its fixed-size strings
+    // remain valid until the callback runs.
+    typedef struct llama_moe_tensor_descriptor {
+        uint32_t present;
+        int32_t  dtype;
+        uint32_t n_dims;
+        int64_t  ne[4];
+        char     name[128];
+    } llama_moe_tensor_descriptor;
+
+    // All model-dependent MoE information is data in this descriptor. The
+    // callback must not infer a model architecture or quantization convention
+    // from a hard-coded branch.
+    typedef struct llama_moe_ffn_descriptor {
+        char     architecture[64];
+        int32_t  layer;
+        int32_t  activation;
+        int32_t  gating;
+        uint32_t normalize_weights;
+        uint32_t weight_before_ffn;
+        float    weight_scale;
+        uint64_t expert_count;
+        uint64_t expert_count_used;
+        llama_moe_tensor_descriptor gate_up;
+        llama_moe_tensor_descriptor gate;
+        llama_moe_tensor_descriptor up;
+        llama_moe_tensor_descriptor down;
+        llama_moe_tensor_descriptor gate_up_bias;
+        llama_moe_tensor_descriptor gate_bias;
+        llama_moe_tensor_descriptor up_bias;
+        llama_moe_tensor_descriptor down_bias;
+        llama_moe_tensor_descriptor gate_scale;
+        llama_moe_tensor_descriptor up_scale;
+        llama_moe_tensor_descriptor down_scale;
+    } llama_moe_ffn_descriptor;
+
+    // Callback used by an opt-in model graph to replace one generic MoE FFN
+    // while keeping attention, normalization, KV cache and the rest of the
+    // graph in llama.cpp. The callback receives routing already resolved by
+    // the common graph builder: selected_experts is [expert_count_used,
+    // n_tokens] I32 and weights is [expert_count_used, n_tokens] F32.
+    // It must write `hidden_width * n_tokens` F32 values to output and return
+    // true on success.
+    typedef bool (*llama_moe_ffn_callback)(
+            void * userdata,
+            const llama_moe_ffn_descriptor * descriptor,
+            const float * hidden,
+            const int32_t * selected_experts,
+            const float * weights,
+            size_t n_tokens,
+            size_t hidden_width,
+            float * output);
+
+    // Installs the opt-in generic MoE replacement callback for this context.
+    // Passing nullptr restores the native llama.cpp expert path.
+    LLAMA_API void llama_set_moe_ffn_callback(
+            struct llama_context * ctx,
+            llama_moe_ffn_callback callback,
+            void * userdata);
+
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
@@ -961,6 +1035,7 @@ extern "C" {
     // Each token can be assigned up to n_seq_max sequence ids
     // The batch has to be freed with llama_batch_free()
     // If embd != 0, llama_batch.embd will be allocated with size of n_tokens * embd * sizeof(float)
+    // and llama_batch.n_embd will be set to embd.
     // Otherwise, llama_batch.token will be allocated to store n_tokens llama_token
     // The rest of the llama_batch members are allocated with size n_tokens
     // All members are left uninitialized
@@ -1016,6 +1091,14 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Tensor parallelism without weight transfer (each rank loads its own
+    // tensor shard). Register a callback that sums a tensor across the group in
+    // place: the reduce op inserted after row-parallel projections calls it
+    // during graph compute. Set the callback to NULL to disable (plain build).
+    typedef void (*llama_tp_reduce_callback)(void * data, size_t n_bytes, void * userdata);
+
+    LLAMA_API void llama_set_tp_reduce_callback(llama_tp_reduce_callback callback, void * userdata);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

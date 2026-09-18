@@ -117,6 +117,9 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.moe_external_executor  = model.uses_external_moe_executor();
+    cparams.moe_external_executor_layers = model.external_moe_executor_layers_data();
+    cparams.moe_external_executor_layer_count = model.external_moe_executor_layers_count();
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -758,6 +761,26 @@ const llama_cparams & llama_context::get_cparams() const {
     return cparams;
 }
 
+void llama_context::set_moe_ffn_descriptor(
+        const llama_moe_ffn_descriptor & descriptor) const {
+    if (descriptor.layer < 0) {
+        return;
+    }
+    const size_t layer = static_cast<size_t>(descriptor.layer);
+    if (moe_ffn_descriptors.size() <= layer) {
+        moe_ffn_descriptors.resize(layer + 1);
+    }
+    moe_ffn_descriptors[layer] = descriptor;
+}
+
+const llama_moe_ffn_descriptor * llama_context::get_moe_ffn_descriptor(
+        int32_t layer) const {
+    if (layer < 0 || static_cast<size_t>(layer) >= moe_ffn_descriptors.size()) {
+        return nullptr;
+    }
+    return &moe_ffn_descriptors[static_cast<size_t>(layer)];
+}
+
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
@@ -1168,6 +1191,14 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_moe_ffn_callback(llama_moe_ffn_callback callback, void * userdata) {
+    cparams.cb_moe_ffn = callback;
+    cparams.cb_moe_ffn_user_data = userdata;
+    if (callback != nullptr && model.uses_external_moe_executor()) {
+        sched_need_reserve = true;
+    }
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1420,6 +1451,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    if (cparams.moe_external_executor && cparams.cb_moe_ffn == nullptr) {
+        LLAMA_LOG_ERROR("%s: external MoE executor is enabled but no callback is installed; refusing native expert fallback\n", __func__);
+        return -1;
+    }
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1658,6 +1694,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    if (cparams.moe_external_executor && cparams.cb_moe_ffn == nullptr) {
+        LLAMA_LOG_ERROR("%s: external MoE executor is enabled but no callback is installed; refusing native expert fallback\n", __func__);
+        return -1;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1673,9 +1714,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const int64_t n_embd_inp = hparams.n_embd_inp();
+    const int64_t n_embd_inp_enc = hparams.n_embd_inp_enc();
+    const int64_t n_embd_out = hparams.n_embd_out();
     // DFlash embd batches carry the fused target features at the encoder input width
-    const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
+    const bool dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
+    const int64_t batch_n_embd = batch_inp.embd && batch_inp.n_embd > 0 ? batch_inp.n_embd : 0;
+    const int64_t n_embd = batch_n_embd > 0 ? batch_n_embd :
+            (mtp_embd ? n_embd_out : dflash_embd ? n_embd_inp_enc : n_embd_inp);
+    const bool canonical_input_width = batch_n_embd == n_embd_inp;
+    const bool expanded_input_width = batch_n_embd == n_embd_out &&
+            n_embd_out > n_embd_inp && n_embd_out % hparams.n_embd == 0;
+    const bool encoder_input_width = dflash_embd && batch_n_embd == n_embd_inp_enc;
+
+    if (batch_n_embd > 0 &&
+            (!canonical_input_width && !expanded_input_width && !encoder_input_width)) {
+        LLAMA_LOG_ERROR(
+                "%s: embedding input shape [%d, %lld] has unsupported width %lld, expected %lld, %lld or %lld\n",
+                __func__, batch_inp.n_tokens, (long long) batch_n_embd, (long long) batch_n_embd,
+                (long long) n_embd_inp, (long long) n_embd_out, (long long) n_embd_inp_enc);
+        return -1;
+    }
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2502,6 +2561,7 @@ llm_graph_params llama_context::graph_params(
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
+        /*.context     =*/ this,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
@@ -3864,12 +3924,44 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }
 
+void llama_set_moe_ffn_callback(
+        llama_context * ctx,
+        llama_moe_ffn_callback callback,
+        void * userdata) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->set_moe_ffn_callback(callback, userdata);
+}
+
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+// tensor parallelism reduce (no weight transfer)
+static llama_tp_reduce_callback g_tp_reduce_callback = nullptr;
+static void * g_tp_reduce_userdata = nullptr;
+
+void llama_set_tp_reduce_callback(llama_tp_reduce_callback callback, void * userdata) {
+    g_tp_reduce_callback = callback;
+    g_tp_reduce_userdata = userdata;
+}
+
+bool llama_tp_reduce_enabled() {
+    return g_tp_reduce_callback != nullptr;
+}
+
+void llama_tp_reduce_fun(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) ith; (void) nth; (void) userdata;
+    const ggml_tensor * src = dst->src[0];
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+    if (g_tp_reduce_callback) {
+        g_tp_reduce_callback(dst->data, ggml_nbytes(dst), g_tp_reduce_userdata);
+    }
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

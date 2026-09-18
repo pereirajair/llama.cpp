@@ -1190,6 +1190,10 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // Metadata-only contexts for routed MoE tensors owned by an external
+    // executor. They deliberately have no backend buffers.
+    std::vector<ggml_context_ptr> external_moe_contexts;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1208,6 +1212,11 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.moe_external_executor_layers != nullptr && params.moe_external_executor_layer_count > 0) {
+        external_moe_executor_layers.assign(
+            params.moe_external_executor_layers,
+            params.moe_external_executor_layers + params.moe_external_executor_layer_count);
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1730,6 +1739,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+    if (auto external_ctx = ml.take_external_moe_context()) {
+        for (auto * cur = ggml_get_first_tensor(external_ctx.get()); cur != NULL; cur = ggml_get_next_tensor(external_ctx.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+        pimpl->external_moe_contexts.emplace_back(std::move(external_ctx));
+    }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -2236,6 +2251,29 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::uses_external_moe_executor() const {
+    return params.moe_external_executor;
+}
+
+bool llama_model::uses_external_moe_executor_layer(int il) const {
+    if (!params.moe_external_executor) {
+        return false;
+    }
+    if (external_moe_executor_layers.empty()) {
+        return true;
+    }
+    return il >= 0 && static_cast<size_t>(il) < external_moe_executor_layers.size()
+        && external_moe_executor_layers[il] != 0;
+}
+
+const uint8_t * llama_model::external_moe_executor_layers_data() const {
+    return external_moe_executor_layers.empty() ? nullptr : external_moe_executor_layers.data();
+}
+
+size_t llama_model::external_moe_executor_layers_count() const {
+    return external_moe_executor_layers.size();
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2539,7 +2577,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2803,6 +2841,9 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_external_executor       =*/ false,
+        /*.moe_external_executor_layers =*/ nullptr,
+        /*.moe_external_executor_layer_count =*/ 0,
     };
 
     return result;
