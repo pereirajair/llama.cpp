@@ -397,6 +397,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // MTP with an external nextn/draft head (POM's llama-engine, mtp.rs)
+    // pairs this model's own trunk hidden state with the draft's embedding
+    // at every position, not just the ones this ubatch requests logits for
+    // - see MtpDrafter::observe. `embeddings_nextn` is the on/off switch and
+    // `embeddings_nextn_masked` (default false, like every other request)
+    // picks dense-unmasked vs logits-only; POM always asks for the dense
+    // form on the target. Skip the early row-drop below only in that case:
+    // it exists to keep ordinary requests (masked stays false but nextn
+    // stays off too) from paying the full per-token FFN/hyper-connection
+    // cost of the last layer during a long prefill, and that has to keep
+    // working exactly as before when nobody asked for nextn.
+    const bool want_full_nextn_state = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
         ple_emb = build_inp_ple(mctx_hyb);
@@ -452,7 +465,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !want_full_nextn_state) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -500,6 +513,23 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
+
+    // Exposed unconditionally, same as every other architecture with a
+    // trained nextn head (see qwen35.cpp): `llama_context` only extracts
+    // this into an output buffer when `embeddings_nextn` is on, so tagging
+    // it here costs nothing when nobody reads it. Row count matches
+    // `want_full_nextn_state` above - dense (this ubatch's full token count)
+    // exactly when nextn asked for it, output-only otherwise, because the
+    // early drop already ran in that case.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (want_full_nextn_state && inp_out_ids) {
+        // The early drop was skipped above to keep every position through
+        // this layer for h_nextn; narrow down to the requested rows now,
+        // before the vocab-sized output projection.
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
